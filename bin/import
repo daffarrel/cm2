@@ -1,0 +1,40 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use Linux::Inotify2;
+use POSIX;
+
+my $shutdown = 0;
+my $installpath = '/export/home/cmsuser/cm2';
+my $customimporter = ''; # Your custom DB script goes here
+
+$SIG{CHLD} = 'IGNORE';
+$SIG{TERM} = sub { $shutdown = 1; };
+fork and exit(0);
+POSIX::setsid;
+fork and exit(0);
+umask(0);
+chdir '/';
+
+open STDOUT, ">>", "$installpath/logs/import.log";
+open STDERR, ">>", "$installpath/logs/import.log";
+$|=1;
+
+my $tablemap = {
+	'custom:real-time:TWCRTSkill' => 'RTSkill'
+};
+
+my $notifier = new Linux::Inotify2;
+$notifier->watch("$installpath/..", IN_CLOSE_WRITE, sub {
+	my $watch = shift;
+	my $filename = $watch->fullname;
+	my ( $cms, $table, $acd ) = split('_',$watch->{name});
+	if ( defined $table && exists $tablemap->{$table} ) {
+		system("perl $installpath/bin/importers/$customimporter $filename $tablemap->{$table} $cms");
+	}
+});
+
+while() {
+	$notifier->poll();	
+}

@@ -1,0 +1,354 @@
+#!/usr/bin/perl
+#
+##
+## Oracle Daemonized watcher and importer service
+## You'll want to customize this for your requirements
+## and put your User / Password as command flags
+##
+#
+
+use warnings;
+use strict;
+use Linux::Inotify2;
+use POSIX;
+use File::Copy;
+use Time::HiRes qw(time);
+use DBI;
+use File::Basename;
+use IO::Handle;
+
+my $name = 'import-oracle-example';
+my $database = '';
+my $shutdown = 0;
+my $installpath = '/export/home/cmsuser/cm2';
+my $runoption = $ARGV[0] if defined $ARGV[0];
+$0 = $name;
+my $pidfilename = "$0.pid";
+my %children = ();
+
+RunStart($runoption);
+
+$SIG{CHLD} = sub {
+	local($1, $?);
+	while ( (my $pid = waitpid( -1, WNOHANG)) > 0 ) {
+		delete $children{$pid};
+	}
+};
+
+$SIG{INT} = sub {
+	$shutdown = 1;
+	kill "INT" => keys %children;
+	unlink $pidfilename;
+	exit(0);
+};
+
+$SIG{USR1} = sub { $shutdown = 1; };
+
+fork and exit(0);
+POSIX::setsid;
+fork and exit(0);
+umask(0);
+
+if ( open my $parentpid, '>', $pidfilename ) { 
+	print $parentpid $$;
+	close $parentpid;
+	print "\nStarting service\n";
+} else {
+	print "\nCannot create pidfile $pidfilename, exiting\n";
+	exit(1);
+}
+
+open STDOUT, ">>", "$installpath/logs/$name.log";
+open STDERR, ">>", "$installpath/logs/$name.log";
+
+my $tablemap = {
+	'custom:real-time:TWCRTAGEN' => 'RTAgent',
+	'custom:real-time:TWCRTSkill' => 'RTSkill'
+};
+
+# Watcher
+
+my %files = ();
+
+while ( not $shutdown ) {
+	CheckOnKids();
+	sleep;
+}
+
+exit(0);
+
+sub CheckOnKids {
+   if (scalar keys %children != 2) {
+      local($SIG{CHLD}) = 'IGNORE';
+      kill 'INT' => keys %children;
+
+      pipe(READER, WRITER);
+      WRITER->autoflush(1);
+      READER->autoflush(1);
+
+      MakeWatcher();
+      MakeSpooler();
+   } else {
+
+   }
+}
+
+sub MakeSpooler {
+	my $pid;
+	my $sig = POSIX::SigSet->new(SIGINT) or die "Can't block signal!\n";
+	sigprocmask(SIG_BLOCK, $sig) or die "Can't block signal!\n";
+
+	$pid = fork;
+	if (not $pid) {
+		$SIG{INT} = sub { exit(0); };
+		$SIG{PIPE} = sub { exit(1); };
+		sigprocmask(SIG_UNBLOCK,$sig);
+		$0 = "$name spooler";
+		close WRITER;
+		my $o_fh = select(STDOUT);
+		$|=1;
+		select($o_fh);
+		my $databaseName = "DBI:Oracle:$database";
+		# You'll want to make these flags or environment variables, BUT since nobody wants to do that testing this
+		# it's here.
+		my $databaseUser = "";
+		my $databasePw = ""; 
+		my $logfile = "/export/home/cmsuser/cm2/logs/$name-spool.log";
+		open my $loghandle, '>', $logfile;
+
+		my $sqlInsert = "insert into RT_SKILL_LOAD
+			(LASTUPDATE, SITE,SPLITNUMBER,SPLITNAME,INQUEUE,OLDESTCALL,STAFFED,AVAILABLE,INACW,ONACD,INAUX,ACDCALLS,ABNCALLS,ACCEPTABLE,ANSTIME,EWTLOW,EWTMEDIUM,EWTHIGH,EWTTOP) 
+			values (sysdate, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, nvl(?,0), nvl(?,0),nvl(?,0),nvl(?,0),nvl(?,0))";
+
+		my $sqlUpdate = "
+				MERGE INTO RT_SKILL_LIVE s using cva.rt_skill_load t ON (s.splitnumber = t.splitnumber and s.site = t.SITE)
+			when matched then UPDATE SET
+			  s.lastupdate = sysdate,
+			  s.splitname = t.SPLITNAME,
+			  s.inqueue = t.inqueue,
+			  s.OLDESTCALL = t.OLDESTCALL,
+			  s.staffed = t.STAFFED,
+			  s.AVAILABLE = t.AVAILABLE,
+			  s.INACW = t.INACW,
+			  s.ONACD = t.ONACD,
+			  s.inaux = t.INAUX,
+			  s.ACDCALLS = t.ACDCALLs,
+			  s.ABNCALLS = t.ABNCALLS,
+			  s.ACCEPTABLE = t.ACCEPTABLE,
+			  s.ANSTIME = t.ANSTIME,
+			  s.EWTLOW = t.EWTLOW,
+			  s.EWTMEDIUM = t.EWTMEDIUM,
+			  s.EWTHIGH = t.EWTHIGH
+			WHEN NOT MATCHED THEN INSERT
+			(s.LASTUPDATE, s.SITE, s.SPLITNUMBER, s.SPLITNAME, s.INQUEUE, s.OLDESTCALL, s.STAFFED, s.AVAILABLE, s.INACW, s.ONACD, s.INAUX, s.ACDCALLS, s.ABNCALLS, s.ACCEPTABLE, s.ANSTIME, s.EWTLOW, s.EWTMEDIUM, s.EWTHIGH, s.EWTTOP)
+			VALUES (t.LASTUPDATE, t.SITE, t.SPLITNUMBER, t.SPLITNAME, t.INQUEUE, t.OLDESTCALL, t.STAFFED, t.AVAILABLE, t.INACW, t.ONACD, t.INAUX, t.ACDCALLS, t.ABNCALLS, t.ACCEPTABLE, t.ANSTIME, t.EWTLOW, t.EWTMEDIUM, t.EWTHIGH, t.EWTTOP)
+		";
+		
+		my $sqlNewSkill = "
+			insert into rt_skill_keys
+				( 	RT_SKILL_ID, 
+					SITE,
+					SPLITNUMBER, 
+					SPLITNAME, 
+					AUDIT_GUID, 
+					CREATE_LOGIN_ID, 
+					LS_CHG_LOGIN_ID, 
+					DELETED, 
+					CREATE_DATE, 
+					LS_CHG_DATE 
+				)
+			select 
+				rt_skill_seq.nextval
+				, l.site
+				, l.splitnumber
+				, l.splitname
+				, sys_guid()
+				, 0
+				, 0
+				, 'N' 
+				, Systimestamp
+				, To_Timestamp( '1900/01/01 00:00:00', 'yyyy/mm/dd hh24:mi:ss' )
+			from 
+				rt_skill_live l 
+			left join 
+				rt_skill_keys k 
+			on 
+				l.site = k. site and 
+				l.splitnumber = k.splitnumber 
+			where 
+				k.rt_skill_id is null
+		";
+
+		
+		$|=1;
+		open STDOUT, ">>", $logfile;
+		open STDERR, ">>", $logfile;
+		my $dbo = DBI->connect($databaseName, $databaseUser, $databasePw, { RaiseError => 1, AutoCommit => 0 , ora_session_mode => 0}) or die "Cannot connect: $DBI::errstr\n";
+		my $hNewSkill= $dbo->prepare($sqlNewSkill);
+		my $hInsert = $dbo->prepare($sqlInsert);
+		my $hUpdate = $dbo->prepare($sqlUpdate);
+
+
+		while (my $message = <READER>) {
+			chomp $message;
+			open my $fh, '<', $message or next and warn "Cannot open file $message\n";
+			my $shortname = fileparse($message);
+			my ( $division ) = split('_',$shortname);
+			$0 = "$name-$division";
+			
+			my $tottime = time;
+
+			# INSERT
+			my $inserttime = time;
+			my $value = 1;
+			my %cols;
+			while ( my $line = <$fh> ) {
+				chomp($line);
+				$line =~ s/\s//g;
+				if ((length($line) >= 10) && (substr($line, 0, 2) eq '||')) {
+					my $lineStart = index($line, '|', index($line,'|') +1) +1;
+					my $lineEnd = rindex($line, '|')-2;
+					my $record = substr($line, $lineStart, $lineEnd);
+					$record =~ s/,/./g;
+					$record =~ s/\|/'\,'/g;
+					$record =~ s/'//g;
+					my @items = split(/\,/,$record,-1);
+					s/'([\d]*)'/$1/g for @items;
+					unshift @items, "$division";
+					next and warn "Too Few Items\n" if scalar @items < 18;
+					for my $i (1 .. 18) {
+						my $item = shift @items;
+						push @{$cols{$i}}, $item;
+					}
+				}
+			}
+
+			close $fh;
+			for my $i (1 .. 18) {
+				my @array = @{$cols{$i}};
+				$hInsert->bind_param_array($i, \@array) or warn "Can't bind $division\n";
+			}
+			$hInsert->execute_array({ InsertStatus=>\my @statusitems }, ) or warn "NO INSERT\n";
+			$hInsert->finish();
+			$inserttime = time - $inserttime;
+
+			# UPDATE
+			my $updatetime = time;
+			$hUpdate->execute() or warn "DBI::errstr" and next;
+			$dbo->commit();
+			$updatetime = time - $updatetime;
+
+			# New Skill Add
+			my $newskilltime = time;
+			$hNewSkill->execute();
+			$hNewSkill->finish();
+			$dbo->commit;
+			$newskilltime= time - $newskilltime;
+
+			# Finish
+			$tottime = time - $tottime;	
+
+			print "Tot-".sprintf("%.3f",1000*$tottime)."\tInsert-".sprintf("%.3f",1000*$inserttime)."\tUpdate-".sprintf("%.3f",1000*$updatetime)."\tNew Skill-".sprintf("%.3f",1000*$newskilltime)."\t$division\n";
+			$0 = "$name-spooler";
+		} 
+		print "Spooler Stopped\n";
+	} else {
+		sigprocmask(SIG_UNBLOCK,$sig);
+		$children{$pid} = "spooler";
+		close READER;
+		return;
+	}
+}
+
+sub MakeWatcher {
+	my $pid;
+	my $sig = POSIX::SigSet->new(SIGINT) or die "Can't block signal!\n";
+	sigprocmask(SIG_BLOCK, $sig) or die "Can't block signal!\n";
+
+	$pid = fork;
+
+	if (not $pid) {
+		$SIG{INT} = sub { exit(0); };
+		$SIG{PIPE} = sub { exit(1); };
+		sigprocmask(SIG_UNBLOCK,$sig);
+		my $o_fh = select(STDOUT);
+		$|=1;
+		select($o_fh);
+		close READER;
+		$0 = "$name-watcher";
+		my $notifier = new Linux::Inotify2;
+		my $count = 0;
+		$notifier->watch("$installpath/..", IN_CLOSE_WRITE, sub {
+			my $watch = shift;
+			my $filename = $watch->fullname;
+			my $shortname = $watch->name;
+			my ( $cms, $table, $acd ) = split('_',$watch->{name});
+			if ( defined $table && exists $tablemap->{$table} ) {
+				if ($tablemap->{$table} eq 'RTSkill') { 					
+					my $time = time;
+					$files{$filename}{'seen'} = $time;
+					if (exists $files{$filename}{'sent'} && $time - $files{$filename}{'sent'} < 10) {
+					} else {
+						print WRITER "$filename\n";
+						$files{$filename}{'sent'} = time;
+					}
+				}
+			}
+		});
+	
+		while( not $shutdown ) {
+			$count = $notifier->poll();	
+		}
+	} else {
+		sigprocmask(SIG_UNBLOCK,$sig);
+		$children{$pid} = "watcher";
+		close WRITER;
+		return;
+	}
+}
+
+sub RunStart {
+	my $runoption = shift;
+	if ( not defined $runoption ) {
+		print "\nNo options given, options are start, stop, and status\n";
+		exit(1);
+	}
+	 
+	if ( $runoption eq 'stop' ) {
+		open my $pidfile, '<', $pidfilename or die "Can't kill that which cannot die!\n";
+		my $pid = <$pidfile>;
+		close $pidfile;
+		
+		my $killstatus = kill 'INT', $pid;
+		print "Process $pid terminated\n";
+		exit(0);
+	}
+
+	if ( $runoption eq 'status' ) {
+		open my $pidfile, '<', $pidfilename or die "No pidfile!\n";
+		my $pid = <$pidfile>;
+		close $pidfile;
+		my $status = kill 'SIGZERO', $pid; 
+		if ($status) {
+			print "\nService returned with $status\n";
+			exit(0);
+		} else {
+			print "\nService is not running, starting...\n";
+			$runoption = 'start';
+		}
+	}
+
+	if ( $runoption ne 'start' ) {
+		print "\nOptions are start, stop, and status\n";
+		exit(0);
+	}
+
+	if (open my $parentpid, '<', $pidfilename ) {
+		my $pid = <$parentpid>;
+		if (kill 'SIGZERO', $pid) {
+			print "\nProcess is already running, process id $pid\n";
+			exit(0);
+		}
+		close $parentpid;
+	}
+}

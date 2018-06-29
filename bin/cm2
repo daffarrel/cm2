@@ -1,0 +1,326 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use lib '../conf/';
+use Net::FTP;
+use IPC::Open3;
+use IO::Select;
+use POSIX;
+use Getopt::Long;
+use Data::Dumper;
+use configfile;
+
+my $programpath = '/export/home/rtdata/cm2';
+my $parentpidfile = $programpath. '/pid/parent.pid';
+my $log = $programpath . '/log/cm2.log';
+my $loglevel = $Switches::loglevel;
+my $sftp = $Switches::sftp;
+my $reportscript = $programpath . 'bin/reportcapture';
+my @reports = @Switches::reports;
+my $ftpinfo = $Switches::ftpinfo;
+my $host = $Switches::hosts->{$Switches::server};
+my $shutdown = 0;
+my $spoolerpid;
+my $autospool = time;
+my $parentpid;
+
+#################################################
+#                                               #
+#  Options & handlers                           #
+#                                               #
+#################################################
+
+my $silent = 0;
+my $configfile = "$programpath/cm2.cfg";
+my $runoption = 'status';
+
+GetOptions(
+	'silent|s'   => \$silent,
+	'conf|c'     => \$configfile
+);
+
+$runoption = $ARGV[0] if defined $ARGV[0];
+
+$SIG{CHLD} = 'IGNORE';
+$SIG{USR1} = \&PingFTP;
+$SIG{USR2} = \&PingParent;
+$SIG{TERM} = sub { $shutdown = 1; };
+
+
+#################################################
+#                                               #
+#  Checkstart process                           #
+#                                               #
+#################################################
+if ($< < 100) { print "Must be run as less-priviliged user\n"; exit(1); } 
+if ($silent) { open(STDOUT, '>', '/dev/null'); }
+if ($runoption eq 'start') {
+	Crontab(1);
+	if (open($parentpid, '<', $parentpidfile)) {
+		Log("Parent PID file found", 5);
+		print "Parent PID found...";
+		while (my $pid = <$parentpid>) {
+			my $processfound = kill 0, $pid;
+			if ( $processfound ) {
+				Log("Process id $pid found, exiting", 5);
+				print "process still alive\n";
+				exit(0);
+			} else {
+				Log("Process id $pid NOT found, restarting", 3);
+				print "not ok, restarting\n";
+				Startup();
+			}
+		}
+	} else {
+		Log("No current PID file, restarting");
+		Startup();
+	}
+} elsif ($runoption eq 'stop') {
+	Crontab(0);
+	if (open($parentpid, '<', $parentpidfile)) {
+		my $pid = <$parentpid>;
+		my $pgid = getpgrp($pid);
+		print "Killing group $pgid\n";
+		kill '-9', $pgid or die "Can't kill process: $!\n";
+		close $parentpid;
+		unlink $parentpidfile;
+	} else {
+		print "Can't find pidfile...forcing\n";
+		exec "pkill -9 cm2";
+	}	
+} elsif ($runoption eq 'status') {
+	print "Running status check...";
+	if (open($parentpid, '<', $parentpidfile)) {
+		while (my $pid = <$parentpid>) {
+			my $processfound = kill 0, $pid;
+			if ( $processfound ) {
+				print "Process running\n";	
+			} else {
+				print "Process not running\n";
+			}
+		}
+	}
+} elsif ($runoption eq 'cease') {
+	print "Ceasing data, setting everything to zero\n";
+	Crontab(0);
+	# TODO: Add a path for ceasing data and setting all the stats to zero
+	if (open($parentpid, '<', $parentpidfile)) {
+		my $pid = <$parentpid>;
+		my $pgid = getpgrp($pid);
+		print "Killing group $pgid\n";
+		kill '-9', $pgid or die "Can't kill process: $!\n";
+		close $parentpid;
+		unlink $parentpidfile;
+	} else {
+		print "Can't find pidfile...forcing\n";
+		exec "pkill -9 cm2";
+	}	print "Killing group\n";
+}	
+exit(0);
+
+#
+#################################################
+#                                               #
+#  Daemon process                               #
+#                                               #
+#################################################
+
+sub Startup {
+	print "Startup!\n";
+	fork and exit(0);
+	POSIX::setsid;
+	fork and exit(0);
+	umask 0;
+	chdir '/';
+	
+	open($parentpid, '>', $parentpidfile);
+	print $parentpid $$;
+	close $parentpid;
+	Log("Process $$ starting", 1);
+	$spoolerpid = &StartSpooler();
+	my @childreports = ();
+	foreach my $report ( @reports ) {
+		push @childreports, &StartReports( $report );
+	}
+	my $sessnum = scalar @childreports;
+	Log("$sessnum Sessions started", 1);
+	$0 = 'cm2 daemon';	
+	while(not $shutdown) {
+		my $spoolerfound = kill 0, $spoolerpid;
+		if ( $spoolerfound ) {
+			Log( "Spooler id $spoolerpid found", 5);
+		} else {
+			Log( "Spooler NOT found, starting", 2);
+			$spoolerpid = &StartSpooler();
+		}
+		my $reportsalive = 0;
+		for my $i (0 .. $#childreports ) {
+			my $reportfound = kill 0, $childreports[$i]->{pid};
+			if ( $reportfound ) {
+				$reportsalive += 1;	
+			} else {
+				Log("Report not found, restarting $childreports[$i]->{pid}", 2);
+				my $report = ( $childreports[$i]->{report} );
+				$childreports[$i] = &StartReports( $report );
+			}
+		}
+		Log("$reportsalive reports alive", 5);
+		sleep 30;
+	}
+	kill '-15', $$;
+	exit(0);
+}
+
+sub PingParent {
+	Log("$$ received USR2!", 4);
+	kill 'USR1', $spoolerpid;
+}
+
+
+#################################################
+#                                               #
+#  Spooler process                              #
+#                                               #
+#################################################
+
+sub StartSpooler {
+	my $parentpid = $$;
+	my $pid = fork();
+	if ($pid) {
+		Log( "Spooler process $pid starting", 2);
+		return $pid;
+	} else {
+		Log( "$parentpid spawned process $$ for spooling", 5);
+		$0 = 'cm2 spooler';
+		while( not $shutdown ) {
+			if (getppid() == 1) { exit(1); }
+			if ( time - $autospool > 30 ) {
+				Log( "Automatic spooling...", 4);
+				SendFTP();
+				Log( "Done!", 5);
+			}
+			sleep 30;
+		}
+	}
+}
+
+sub SendFTP {
+	my $dir;
+	if ( $sftp > 0 ) {
+		opendir($dir, "$programpath/outfiles");
+		while ( my $file = readdir($dir) ) {
+			next unless (-f "$programpath/outfiles/$file" );
+			if ( $sftp > 1 ) {
+				`scp -o 'IdentityFile $programpath/lib/id_rsa' -o 'StrictHostKeyChecking=no' $programpath/outfiles/* cmsuser\@$host:` or warn Log("scp failed: $?");
+			} else {
+				`sftp -o 'IdentityFile $programpath/lib/id_rsa' -o 'ConnectTimeout 1' -b $programpath/bin/cm2sftp $ftpinfo->{username}\@$host 2>/dev/null` or warn Log("sFTP failed: $?");
+			}
+			Log("sFTP- $programpath/outfiles/$file", 4);
+			unlink( "$programpath/outfiles/$file") or die "Can't unlink file\n";
+		}
+	} else {
+		my $ftp = Net::FTP->new($host, Timeout => 1) or die "Can't connect\n";
+		$ftp->login($ftpinfo->{username},$ftpinfo->{password}) or warn "Can't login\n";
+		opendir($dir, "$programpath/outfiles");
+		while ( my $file = readdir($dir) ) {
+			next unless (-f "$programpath/outfiles/$file" );
+			Log("FTP- $programpath/outfiles/$file", 4);	
+			$ftp->put("$programpath/outfiles/$file") or warn "Can't find file\n";
+			unlink( "$programpath/outfiles/$file") or die "Can't unlink file\n";
+		}
+		$ftp->quit;
+	}
+}
+
+sub PingFTP {
+	Log("$$ received USR1! Manual Spooling.", 5);
+	SendFTP();
+	Log("Done!", 5);
+	$autospool = time;
+}
+
+
+#################################################
+#                                               #
+#  Report processes                             #
+#                                               #
+#################################################
+
+sub StartReports {
+	my $session;
+	my $report = shift;
+		my $parentpid = $$;
+		my $pid = fork();
+		if ($pid) {
+			Log("Report session Starting", 4);
+			$session = { 'report' => $report, 'pid' => $pid };
+		} else {
+			exec "perl $report->{script} $report->{args}";
+		}
+	return $session;
+}
+
+
+#################################################
+#                                               #
+#  Helper processes                             #
+#                                               #
+#################################################
+
+sub Log {
+	my $message = shift;
+	my $priority = shift;
+	$priority = '5' if not defined $priority;
+	open my $logfile, '>>', $log;
+	my $curtime = time;
+	if ( $priority <= $loglevel ) {
+		print $logfile "$curtime : $priority: $message\n";
+	}
+}
+
+sub Crontab {
+	my $enable = shift;
+	my $modified = 0;
+	my $found = 0;
+	my @crontab = `crontab -l`;
+	for my $line (@crontab) {
+		if ($enable == 1) {
+			if ($line =~ m/^\#.*\/cm2/) {
+				if ($found) {
+					$line = undef;
+				} else {
+					$line =~ s/^\#//;
+					$modified = 1;
+					$found = 1;
+				}
+			} elsif ($line =~ m/^[^\#].*\/cm2/) {
+				if ($found) {
+					$line = undef;
+				} else {
+					$modified = 1;
+					$found = 1;
+				}
+			}
+		} elsif ($enable == 0) {
+			if ($line =~ m/^[^\#].*\/cm2/) {
+				if ($found) {
+					$line = undef;
+				} else {
+					$line = "#$line";
+					$modified = 1;
+				}
+			}
+		}
+	}
+	@crontab = grep{defined}@crontab;
+	if ( !$modified && $enable) {
+		push @crontab, "* * * * * $programpath/bin/cm2 start > $programpath/log/start.log\n";
+		$modified = 1;
+	}
+	if ($modified) {
+		open( my $cronhandle, "|crontab -");
+		print $cronhandle @crontab;
+		close $cronhandle;
+	}
+}

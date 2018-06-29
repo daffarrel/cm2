@@ -1,0 +1,13 @@
+# cm2 LogRotate instructions
+
+/export/home/cmsuser/cm2/log/*.log {
+        create 600 cmsuser cmsuser
+        daily
+        rotate 5
+        missingok
+        compress
+    postrotate
+	   /usr/bin/killall -HUP import-era
+	   /usr/bin/killall -HUP import-mysql
+    endscript
+}

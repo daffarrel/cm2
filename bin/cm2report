@@ -1,0 +1,68 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+use IPC::Open3;
+use IO::Select;
+
+my $programpath = '/export/home/rtdata/cm2';
+my ($cin, $cout, $cerr);
+
+my $pid = open3($cin, $cout, $cerr, '/cms/toolsbin/clint');
+
+my $read = IO::Select->new($cout, $cerr);
+my $shutdown = 0;
+
+my $line = '';
+my $errln = '';
+
+$SIG{ALRM} = sub { print "Report timeout\n"; exit(0); };
+$SIG{TERM} = sub { $shutdown = 1; };
+
+my $cms 	= shift;
+my $report 	= shift;
+my $field1 	= shift;
+my $field2 	= shift;
+my $field3 	= shift;
+
+
+print $cin "do menu 0 \"$report\"\nset field 1 \"$field1\"\nset field 2 \"$field2\"\nset field 3 \"$field3\"\ndo \"run\"\n";
+alarm 5;
+print $cin "watch\n";
+
+my $outfile;
+my $inc = 0;
+$inc+=1;
+$0 = "cm2report $report $field1";
+while (not $shutdown && not getppid() == 1) {
+	#print "Ready...\n";
+	while (my @ready = $read->can_read(1)) {
+		#print "Processing STDIN\n";
+		open $outfile, ">", "$programpath/outfiles/$cms\_$report\_$field1" or die "Can't write file\n";
+		foreach my $fh (@ready) {
+			if (getppid == 1) { exit(0); }
+			if (fileno($fh) == fileno($cout)) {
+				#print "Processing fh " . fileno($fh). "\n";
+				while (my $line = <$fh>) {
+					print $outfile $line;
+					#print $line;
+					alarm 20;
+					if ( $line =~ /Success/ ) {
+						#print "END RECORD\n";
+						close $outfile;
+						$inc+=1;
+						kill 'USR2', getppid();
+						last;
+					}
+				}
+			} else {
+				#print "Skipping FH\n";
+			}
+		}
+	sleep 1
+	}
+}
+
+
+
+waitpid($pid, 1);
